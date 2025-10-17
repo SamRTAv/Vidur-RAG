@@ -1,0 +1,168 @@
+# utils.py
+import os
+import json
+from langchain_groq import ChatGroq
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from config import USER_DATA_PATH, RAG_BASE_DIRECTORY, RAG_CATEGORIES
+import shutil
+
+
+# LLM setup
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0,
+    max_tokens=4000
+)
+
+# Text splitter
+text_splitter = RecursiveCharacterTextSplitter(
+    separators=["\n\n", "\n", ".", " ", ""],
+    chunk_size=500,
+    chunk_overlap=100,
+    length_function=len
+)
+
+# Embeddings
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Load user data
+def load_user_data():
+    try:
+        if os.path.exists(USER_DATA_PATH) and os.path.getsize(USER_DATA_PATH) > 0:
+            with open(USER_DATA_PATH, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"users": {}, "user_info": {}}
+
+# Save user data
+def save_user_data(data):
+    with open(USER_DATA_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+# Initialize RAG with per-category vector stores and QA chains
+def initialize_rag():
+    vector_stores = {}
+    qa_chains = {}
+    
+    # Updated prompt template for advice-focused responses
+    custom_prompt_template = """
+    You are a {category} wellness expert. Provide helpful advice with specific actions:
+    
+    1. Start with a brief empathetic response to the user's concern
+    2. Offer 1-3 actionable suggestions with brief explanations
+    3. End with an open-ended question to continue conversation
+    
+    Guidelines:
+    - Keep responses conversational and supportive
+    - Avoid clinical jargon
+    - Focus on practical, implementable advice
+    - Maintain hopeful and encouraging tone
+    
+    Context:
+    {context}
+    
+    Question: {question}
+    """
+    
+    # Create vector stores and QA chains for each category
+    for category in RAG_CATEGORIES:
+        persist_dir = f"./chroma_db_{category}"
+        if os.path.exists(persist_dir):
+            shutil.rmtree(persist_dir)
+        
+        # Process documents
+        dir_path = os.path.join(RAG_BASE_DIRECTORY, category)
+        docs = []
+        if os.path.exists(dir_path):
+            for filename in os.listdir(dir_path):
+                if filename.endswith('.txt'):
+                    file_path = os.path.join(dir_path, filename)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            text = f.read()
+                        chunks = text_splitter.split_text(text)
+                        for chunk in chunks:
+                            if chunk.strip():
+                                metadata = {
+                                    "source": filename,
+                                    "category": category
+                                }
+                                docs.append(Document(
+                
+                                    page_content=chunk.strip(),
+                                    metadata=metadata
+                                ))
+                    except Exception as e:
+                        print(f"Error processing {file_path}: {e}")
+        
+        # Create vector store
+        if docs:
+            vector_store = Chroma.from_documents(
+                documents=docs,
+                embedding=embeddings,
+                persist_directory=persist_dir
+            )
+            vector_store.persist()
+            vector_stores[category] = vector_store
+            
+            # Create QA chain with updated prompt
+            prompt = PromptTemplate(
+                template=custom_prompt_template.replace("{category}", category),
+                input_variables=["context", "question"]
+            )
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=vector_store.as_retriever(search_kwargs={"k": 5}),
+                chain_type_kwargs={"prompt": prompt},
+                return_source_documents=True
+            )
+            qa_chains[category] = qa_chain
+            print(f"Initialized {category} QA chain with {len(docs)} documents")
+    
+    return qa_chains
+
+# Classify question to category
+def classify_question_category(question):
+    prompt = f"""
+    Classify this question into one category: {', '.join(RAG_CATEGORIES)}
+    Question: {question}
+    Respond with only the category name.
+    """
+    response = llm.invoke(prompt)
+    print(response)
+    return response.content.strip()
+
+# Get RAG response using category-specific QA chain
+def get_rag_response(question, qa_chains):
+    # Classify question
+    category = classify_question_category(question)
+    
+    if category not in qa_chains:
+        # Fallback to first available chain
+        category = list(qa_chains.keys())[0]
+    
+    # Get response
+    result = qa_chains[category].invoke({"query": question})
+    return result['result']
+
+
+# Classify user input
+def classify_input(user_input):
+    prompt = f"""
+    Classify the following user input into one of these categories:
+    1. "question" - If the user is asking a factual question that could be answered with knowledge
+    2. "general" - If the user is just chatting or expressing feelings
+
+    User Input: {user_input}
+
+    Respond with only one word: either "question" or "general"
+    """
+    response = llm.invoke(prompt)
+    return response.content.strip().lower()
